@@ -1,0 +1,264 @@
+python scripts/sparsity_sim.py
+python scripts/replot.py
+
+
+---
+
+### File 2: `scripts/elfen_adapter.py`
+*(Create a folder called `scripts`, then create this file inside it)*
+
+```python
+#!/usr/bin/env python3
+"""
+elfen_adapter.py — extract Linux-schema features from ELFEN JSON reports.
+"""
+from __future__ import annotations
+import argparse, json, os, re, sys
+from pathlib import Path
+from typing import Any
+
+# ---------------------------------------------------------------------------
+# Normalisation
+# ---------------------------------------------------------------------------
+UUID_RE     = re.compile(r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}')
+ID_MIXED_RE = re.compile(r'[0-9a-fA-F]{8}-[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}')
+LONG_HEX_RE = re.compile(r'\b[0-9a-fA-F]{20,}\b')
+PID_PATH_RE = re.compile(r'/proc/\d+(?=/)')
+DATE_RE     = re.compile(r'\b\d{4}[-_]\d{2}[-_]\d{2}\b')
+NUM_RE      = re.compile(r'(?<![A-Za-z0-9])\d{3,}(?![A-Za-z0-9])')
+
+PUBLIC_RESOLVERS = {
+    '1.1.1.1', '1.0.0.1', '8.8.8.8', '8.8.4.4',
+    '9.9.9.9', '149.112.112.112',
+    '208.67.222.222', '208.67.220.220',
+}
+PRIVATE_PREFIXES = ('10.', '172.16.', '172.17.', '172.18.', '172.19.',
+                    '172.2', '172.30.', '172.31.', '192.168.')
+
+def strip_bytes(s: str) -> str:
+    if not s: return ''
+    s = s.strip()
+    if s.startswith("b'") and s.endswith("'"):
+        s = s[2:-1]
+    return s.replace('\\x00', '')
+
+def normalise_path(p: str) -> str:
+    p = strip_bytes(p)
+    if not p: return ''
+    p = PID_PATH_RE.sub('/proc/PID', p)
+    p = UUID_RE.sub('UUID', p)
+    p = ID_MIXED_RE.sub('ID', p)
+    p = LONG_HEX_RE.sub('HEX', p)
+    p = DATE_RE.sub('DATE', p)
+    p = NUM_RE.sub('N', p)
+    return p
+
+def normalise_arg(s: str) -> str:
+    s = strip_bytes(s)
+    if not s: return ''
+    if '=' in s:
+        key, _, val = s.partition('=')
+        return f'{key}={normalise_path(val)}'
+    return normalise_path(s)
+
+def classify_ip(ip: str) -> str:
+    if ip in PUBLIC_RESOLVERS: return 'PUBLIC_RESOLVER'
+    if ip.startswith('127.'):  return 'LOOPBACK'
+    if ip.startswith(PRIVATE_PREFIXES): return 'PRIVATE_IP'
+    return 'EXTERNAL_IP'
+
+def classify_dns(domain: str) -> str:
+    domain = strip_bytes(domain).strip('.').lower()
+    if not domain: return ''
+    parts = domain.split('.')
+    return '*.' + '.'.join(parts[-2:]) if len(parts) >= 2 else domain
+
+def classify_path_kind(p: str) -> str:
+    if p.startswith('/proc/') or p.startswith('/sys/'): return 'PROC'
+    for prefix in ('/lib/', '/lib64/', '/usr/lib/', '/usr/lib64/', '/usr/local/lib/', '/usr/local/lib64/'):
+        if p.startswith(prefix): return 'LIB'
+    return 'FILE'
+
+def parse_args_block(block: str) -> dict[str, str]:
+    out: dict[str, str] = {}
+    if not block: return out
+    for line in block.split('\n'):
+        if ':' not in line: continue
+        k, _, v = line.partition(':')
+        out[k.strip()] = strip_bytes(v.strip())
+    return out
+
+GROUPS = ('EXEC', 'PROC', 'FILE', 'DIR', 'CMD', 'NET', 'LIB', 'DROP', 'TTP')
+
+def group_of(feature: str) -> str:
+    head = feature.split('::', 1)[0]
+    if head.startswith('NET_'):  return 'NET'
+    if head.startswith('FILE_'): return 'FILE'
+    return head
+
+def extract_features(report: dict[str, Any]) -> dict[str, Any]:
+    warnings: list[str] = []
+    rpt = report.get('report', {}) or {}
+    data = rpt.get('data', {}) or {}
+    static = data.get('static', {}) or {}
+    dynamic = data.get('dynamic', {}) or {}
+
+    sample = rpt.get('sample_metadata', {}) or {}
+    family = rpt.get('family') or []
+    if not family:
+        warnings.append('family label is empty; cross-reference the SHA-256 externally')
+    task_status = rpt.get('task_status', '')
+    if task_status not in ('Complete', 'Finished'):
+        warnings.append(f'task_status = {task_status!r}; run may be incomplete')
+
+    feats: set[str] = set()
+    dropped = (dynamic.get('droppedfiles', {}) or {}).get('data') or []
+    fileops = (dynamic.get('fileops', {}) or {}).get('data') or []
+    op_paths: set[str] = set()
+    for ev in fileops:
+        a = parse_args_block(ev.get('args', ''))
+        for key in ('file_path', 'oldfile_path', 'newfile_path', 'buffer'):
+            v = strip_bytes(a.get(key, ''))
+            if v.startswith('/'): op_paths.add(v)
+    for d in dropped: op_paths.add(d)
+
+    def recover(p: str) -> str:
+        p = strip_bytes(p)
+        if not p: return p
+        best = p
+        for full in op_paths:
+            if full.startswith(p) and len(full) > len(best): best = full
+        return best
+
+    def emit_path(p: str, access: str) -> None:
+        raw = p.rstrip('/')
+        pn = normalise_path(p)
+        if not pn: return
+        kind = classify_path_kind(pn)
+        if kind == 'PROC': feats.add(f'PROC::{pn}')
+        elif kind == 'LIB': feats.add(f'LIB::{pn}')
+        else:
+            prefix = raw + '/'
+            is_dir = any(q.startswith(prefix) for q in op_paths if q != raw)
+            if is_dir: feats.add(f'DIR::{pn}')
+            else:
+                suffix = {'R': 'FILE_R', 'W': 'FILE_W', '?': 'FILE'}[access]
+                feats.add(f'{suffix}::{pn}')
+
+    for ev in (dynamic.get('procops', {}) or {}).get('data') or []:
+        fn = ev.get('func', '')
+        if fn in ('fork', 'clone', 'execve'): feats.add(f'PROC::{fn}')
+        if fn == 'execve':
+            args = parse_args_block(ev.get('args', ''))
+            exe = args.get('exec_path', '')
+            if exe: feats.add(f'EXEC::{normalise_path(exe)}')
+            for k, v in args.items():
+                if k.startswith('arg') and v:
+                    na = normalise_arg(v)
+                    if na: feats.add(f'CMD::{na}')
+
+    for ev in fileops:
+        fn = ev.get('func', '')
+        args = parse_args_block(ev.get('args', ''))
+        if fn == 'open':
+            p = recover(args.get('file_path', ''))
+            try: flags = int(args.get('flags', '0'))
+            except ValueError: flags = 0
+            access = 'W' if (flags & 0x3) else 'R'
+            emit_path(p, access)
+        elif fn == 'rename':
+            old = recover(args.get('oldfile_path', ''))
+            new = recover(args.get('newfile_path', ''))
+            emit_path(old, 'W'); emit_path(new, 'W')
+            ext = os.path.splitext(normalise_path(new))[1].lower()
+            if ext: feats.add(f'DROP::EXT:{ext.lstrip(".")}')
+        elif fn == 'unlink':
+            emit_path(recover(args.get('file_path', '')), 'W')
+
+    for p in dropped:
+        base = p.rsplit('/', 1)[-1]
+        if base:
+            feats.add(f'DROP::{base}')
+            ext = os.path.splitext(base)[1].lower()
+            if ext: feats.add(f'DROP::EXT:{ext.lstrip(".")}')
+
+    sf = (static.get('samplefeatures', {}) or {}).get('data') or {}
+    for lib in sf.get('Library dependencies') or []:
+        if isinstance(lib, str) and lib: feats.add(f'LIB::{normalise_path(lib)}')
+
+    for ev in (dynamic.get('netops', {}) or {}).get('data') or []:
+        args = parse_args_block(ev.get('args', ''))
+        ip = args.get('addr') or args.get('ip') or args.get('daddr')
+        dom = args.get('domain') or args.get('name') or args.get('host')
+        if ip: feats.add(f'NET::{classify_ip(ip)}')
+        if dom:
+            cd = classify_dns(dom)
+            if cd: feats.add(f'NET_DNS::{cd}')
+
+    detection = data.get('detection', {}) or {}
+    if isinstance(detection, dict):
+        for key in ('attck', 'mitre_attck', 'attack', 'techniques'):
+            for ttp in detection.get(key, []) or []:
+                if isinstance(ttp, str) and ttp.startswith('T'): feats.add(f'TTP::{ttp}')
+                elif isinstance(ttp, dict):
+                    tid = ttp.get('technique_id') or ttp.get('id')
+                    if tid: feats.add(f'TTP::{tid}')
+
+    by_group: dict[str, list[str]] = {g: [] for g in GROUPS}
+    for f in feats:
+        g = group_of(f)
+        if g in by_group: by_group[g].append(f)
+    for g in by_group: by_group[g].sort()
+
+    return {
+        'sample': {
+            'sha256': sample.get('sha256', ''), 'md5': sample.get('md5', ''),
+            'family': family, 'arch': sample.get('arch', ''),
+            'bitness': sample.get('bitness', ''), 'task_status': task_status,
+            'cmdline': rpt.get('task_cmdline', ''),
+        },
+        'features': by_group, 'counts': {g: len(v) for g, v in by_group.items()},
+        'total_features': sum(len(v) for v in by_group.values()), 'warnings': warnings,
+    }
+
+def check_mlran(result: dict[str, Any], rfe_path: str) -> None:
+    with open(rfe_path) as f: rfe = json.load(f)
+    names = list(rfe.values()) if isinstance(rfe, dict) else rfe
+    flat = {f for g in result['features'].values() for f in g}
+    matched = sorted(n for n in names if n in flat)
+    result['mlran'] = {'total': len(names), 'matched': len(matched)}
+
+def iter_inputs(path: Path):
+    if path.is_file(): yield path
+    elif path.is_dir():
+        for p in sorted(path.rglob('*.json')): yield p
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(description='ELFEN -> Linux schema feature extractor')
+    ap.add_argument('input', type=Path)
+    ap.add_argument('--mlran-rfe', type=Path)
+    ap.add_argument('--output', type=Path)
+    ap.add_argument('--pretty', action='store_true')
+    args = ap.parse_args(argv)
+    out_fh = open(args.output, 'w') if args.output else sys.stdout
+    try:
+        n_ok = 0
+        for path in iter_inputs(args.input):
+            try:
+                with open(path) as f: report = json.load(f)
+            except (OSError, json.JSONDecodeError) as e:
+                print(f'# skip {path}: {e}', file=sys.stderr); continue
+            result = extract_features(report)
+            result['source_file'] = str(path)
+            if args.mlran_rfe: check_mlran(result, str(args.mlran_rfe))
+            if args.output: out_fh.write(json.dumps(result, ensure_ascii=False) + '\n')
+            else:
+                json.dump(result, out_fh, ensure_ascii=False, indent=2 if args.pretty else None)
+                out_fh.write('\n')
+            n_ok += 1
+    finally:
+        if args.output: out_fh.close()
+    print(f'# processed {n_ok} file(s)', file=sys.stderr)
+    return 0
+
+if __name__ == '__main__': sys.exit(main())
